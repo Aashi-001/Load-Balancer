@@ -2,15 +2,44 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"log"
 	"math/rand"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+	"gopkg.in/yaml.v2"
 )
 
+// import "os"
+
+
+type Config struct {
+	Server struct {
+		Host string `yaml:"host"`
+		Port string    `yaml:"port"`
+	} `yaml:"server"`
+
+	Backends    []string `yaml:"backends"`
+	Algorithm   string   `yaml:"algorithm"`
+	HealthCheck struct {
+		Interval time.Duration `yaml:"interval"`
+		Timeout  time.Duration `yaml:"timeout"`
+		Path     string        `yaml:"path"`
+	} `yaml:"health_check"`
+}
+
 type simpleServer struct {
-	addr  string
-	proxy *httputil.ReverseProxy
+	addr        string
+	proxy       *httputil.ReverseProxy
+	activeConns int32
+	alive       bool
+	mu          sync.RWMutex
+	requests    int64
 }
 
 type Server interface {
@@ -19,15 +48,53 @@ type Server interface {
 	Serve(rw http.ResponseWriter, r *http.Request)
 }
 
+
 type LoadBalancer struct {
 	servers   []Server
 	port      string
 	algorithm string
+	mu        sync.RWMutex
 }
 
 func handleErr(err error) {
 	if err != nil {
 		fmt.Println(err)
+	}
+}
+
+func (s *simpleServer) increment() {
+	// atomic.AddInt32(&s.activeConns, 1)
+	atomic.AddInt32(&s.activeConns, 1)
+	atomic.AddInt64(&s.requests, 1)
+}
+
+func (s *simpleServer) decrement() {
+	atomic.AddInt32(&s.activeConns, -1)
+}
+
+func (s *simpleServer) getActiveConns() int32 {
+	return atomic.LoadInt32(&s.activeConns)
+}
+
+func (s *simpleServer) Address() string { return s.addr }
+
+// func (s *simpleServer) isAlive() bool { return true }
+func (s *simpleServer) isAlive() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.alive
+}
+
+func (s *simpleServer) checkHealth() {
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(s.addr + "/health")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err != nil || resp.StatusCode != http.StatusOK {
+		s.alive = false
+	} else {
+		s.alive = true
+		resp.Body.Close()
 	}
 }
 
@@ -37,6 +104,7 @@ func initialiseServer(addr string) *simpleServer {
 	return &simpleServer{
 		addr:  addr,
 		proxy: httputil.NewSingleHostReverseProxy(serverUrl),
+		alive: true,
 	}
 }
 
@@ -48,22 +116,134 @@ func newLoadBalancer(servers []Server, port string, algo string) *LoadBalancer {
 	}
 }
 
-func (s *simpleServer) Address() string { return s.addr }
+var rrCounter int32
 
-func (s *simpleServer) isAlive() bool { return true }
+func (lb *LoadBalancer) getNextRoundRobinServer() Server {
+	// start := rrIndex
+	// for {
+	// 	server := lb.servers[rrIndex]
+	// 	rrIndex = (rrIndex + 1) % len(lb.servers)
+	// 	if server.isAlive() {
+	// 		return server
+	// 	}
+	// 	if rrIndex == start {
+	// 		return server
+	// 	}
+	// }
+	// println("starting roundrobin")
+	// total := int32(len(lb.servers))
+	// if total == 0 {
+	// 	log.Println("No backend servers available")
+	// 	return nil
+	// }
 
-func (s *simpleServer) Serve(rw http.ResponseWriter, req *http.Request) {
-	s.proxy.ServeHTTP(rw, req)
+	// for {
+	// 	println("entering for loop")
+	// 	index := atomic.AddInt32(&rrCounter, 1)
+	// 	if index < 0 {
+	// 		index = 0
+	// 		atomic.StoreInt32(&rrCounter, 0)
+	// 	}
+	// 	println("index is: ", index)
+	// 	server := lb.servers[int(index)%int(total)]
+	// 	if server.isAlive() {
+	// 		println("returning: ", server.Address())
+	// 		return server
+	// 	}
+	// }
+	// println("nothing selected")
+	// return nil
+	total := len(lb.servers)
+	if total == 0 {
+		return nil
+	}
+	
+	// index := atomic.AddInt32(&rrCounter, 1)
+	// if index < 0 {
+	// 	index = 0
+	// 	atomic.StoreInt32(&rrCounter, 0)
+	// }
+	
+	// return lb.servers[int(index)%total]
+	cnt := 0
+	for range total {
+		index := atomic.AddInt32(&rrCounter, 1)
+		if index < 0 {
+			index = 0
+			atomic.StoreInt32(&rrCounter, 0)
+		}
+		// if index > int32(total) {
+		// 	if cnt > 3 {
+		// 		return nil
+		// 	}
+		// 	index = 0
+		// }
+		server := lb.servers[int(index)%total]
+		println("checking aliveness")
+		if server.isAlive() {
+			return server
+		}
+		cnt++
+	}
+
+	return nil
 }
 
-// get next available server -> return a server
-func (lb *LoadBalancer) getNextAvailableSever() Server {
-	// random
-	//server := lb.servers[rand.Intn(len(lb.servers))]
-	//for server.isAlive() {
-	//	server = lb.servers[rand.Intn(len(lb.servers))]
-	//}
-	//return server
+func (lb *LoadBalancer) getLeastConnServer() Server {
+	// minConn := int32(^uint32(0) >> 1) // max int
+	// // var selected Server
+	// var selected *simpleServer
+	// // for _, s := range lb.servers {
+	// // 	if s.isAlive() {
+	// // 		ss := s.(*simpleServer)
+	// // 		println(ss.activeConns)
+	// // 		if ss.activeConns < minConn {
+	// // 			minConn = ss.activeConns
+	// // 			selected = ss
+	// // 		}
+	// // 	}
+	// // }
+	// for _, s := range lb.servers {
+	// 	if s.isAlive() {
+	// 		ss := s.(*simpleServer)
+	// 		println(ss.getActiveConns())
+	// 		curr := ss.getActiveConns()
+	// 		if curr < minConn {
+	// 			minConn = curr
+	// 			selected = ss
+	// 		}
+	// 	}
+	// }
+
+	// if selected != nil {
+	// 	selected.increment()
+	// }
+
+	// return selected
+	var selected *simpleServer
+	min := int32(^uint32(0) >> 1)
+	lb.mu.RLock()
+	defer lb.mu.RUnlock()
+	for _, srv := range lb.servers {
+		if srv.isAlive() {
+			ss := srv.(*simpleServer)
+			if c := ss.getActiveConns(); c < min {
+				selected = ss
+				min = c
+			}
+		}
+	}
+
+	for _, srv := range lb.servers {
+		ss := srv.(*simpleServer)
+		fmt.Printf("Server: %s | Active: %d | Alive: %v\n", ss.addr, ss.getActiveConns(), ss.isAlive())
+	}
+
+
+	return selected
+}
+
+func (lb *LoadBalancer) getRandomServer() Server {
 	for {
 		server := lb.servers[rand.Intn(len(lb.servers))]
 		if server.isAlive() {
@@ -72,29 +252,123 @@ func (lb *LoadBalancer) getNextAvailableSever() Server {
 	}
 }
 
+func (lb *LoadBalancer) getNextAvailableSever() Server {
+	println(lb.algorithm)
+	switch lb.algorithm {
+	case "roundrobin":
+		return lb.getNextRoundRobinServer()
+	case "leastconn":
+		return lb.getLeastConnServer()
+	default:
+		return lb.getRandomServer()
+	}
+}
+
+func (s *simpleServer) Serve(rw http.ResponseWriter, req *http.Request) {
+	s.increment()
+	// defer s.decrement()
+	defer func() {
+		s.decrement()
+		fmt.Println("Decremented:", s.getActiveConns())
+	}()
+	s.proxy.ServeHTTP(rw, req)
+}
+
+// get next available server -> return a server
+// func (lb *LoadBalancer) getNextAvailableSever() Server {
+// 	// random
+// 	//server := lb.servers[rand.Intn(len(lb.servers))]
+// 	//for server.isAlive() {
+// 	//	server = lb.servers[rand.Intn(len(lb.servers))]
+// 	//}
+// 	//return server
+// 	for {
+// 		server := lb.servers[rand.Intn(len(lb.servers))]
+// 		if server.isAlive() {
+// 			return server
+// 		}
+// 	}
+// }
+
 func (lb *LoadBalancer) serveProxy(rw http.ResponseWriter, req *http.Request) {
+	log.Println("Incoming request")
 	targetServer := lb.getNextAvailableSever()
+	if targetServer == nil {
+		log.Println("No alive servers available!")
+		http.Error(rw, "Service unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	fmt.Println("Serving request to ", targetServer.Address())
 	targetServer.Serve(rw, req)
 }
 
+func readFile(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+func loadConfig(path string) Config {
+	data, err := readFile(path)
+	if err != nil {
+		log.Fatalf("Cannot read config file: %v", err)
+	}
+	var cfg Config
+	err = yaml.Unmarshal(data, &cfg)
+	if err != nil {
+		log.Fatalf("Invalid config YAML: %v", err)
+	}
+	return cfg
+}
+
 func main() {
-	servers := []Server{
-		initialiseServer("http://localhost:9000"),
-		initialiseServer("http://localhost:9001"),
-		initialiseServer("http://localhost:9002"),
+	// servers := []Server{
+	// 	initialiseServer("http://localhost:9000"),
+	// 	initialiseServer("http://localhost:9001"),
+	// 	initialiseServer("http://localhost:9002"),
+	// }
+
+	// lb := newLoadBalancer(servers, "8000", "leastconn")
+
+	// handleRedirect := func(rw http.ResponseWriter, req *http.Request) {
+	// 	lb.serveProxy(rw, req)
+	// }
+
+	// http.HandleFunc("/", handleRedirect)
+
+	// fmt.Println("Starting server on port", lb.port)
+
+	// err := http.ListenAndServe(":"+lb.port, nil)
+	// handleErr(err)
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	cfg := loadConfig("../configs/config.yaml")
+	fmt.Println(cfg.Server.Host)
+	fmt.Println(cfg.HealthCheck.Interval)
+
+	var servers []Server
+	for _, addr := range cfg.Backends {
+		servers = append(servers, initialiseServer(addr))
 	}
 
-	lb := newLoadBalancer(servers, "8000", "roundrobin")
+	lb := newLoadBalancer(servers, cfg.Server.Port, cfg.Algorithm)
 
-	handleRedirect := func(rw http.ResponseWriter, req *http.Request) {
-		lb.serveProxy(rw, req)
+	go func() {
+		for {
+			for _, s := range lb.servers {
+				go s.(*simpleServer).checkHealth()
+			}
+			time.Sleep(5 * time.Second)
+		}
+	}()
+
+	http.HandleFunc("/", lb.serveProxy)
+
+	log.Printf("Starting load balancer on port %s using %s algorithm\n", cfg.Server.Port, cfg.Algorithm)
+	err := http.ListenAndServe(":"+ cfg.Server.Port, nil)
+	if err != nil {
+		log.Fatalf("Server failed: %v", err)
 	}
-
-	http.HandleFunc("/", handleRedirect)
-
-	fmt.Println("Starting server on port", lb.port)
-
-	err := http.ListenAndServe(":"+lb.port, nil)
-	handleErr(err)
 }
