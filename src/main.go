@@ -13,10 +13,12 @@ import (
 	"sync/atomic"
 	"time"
 	"gopkg.in/yaml.v2"
+	"database/sql"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // import "os"
-
+var db *sql.DB
 
 type Config struct {
 	Server struct {
@@ -56,6 +58,67 @@ type LoadBalancer struct {
 	mu        sync.RWMutex
 }
 
+type loggingResponseWriter struct {
+    http.ResponseWriter
+    statusCode int
+}
+
+func (lrw *loggingResponseWriter) WriteHeader(code int) {
+    lrw.statusCode = code
+    lrw.ResponseWriter.WriteHeader(code)
+}
+
+
+func setupDB(path string) *sql.DB {
+    db, err := sql.Open("sqlite3", path)
+    if err != nil {
+        log.Fatalf("Failed to open DB: %v", err)
+    }
+
+    schema := `
+    CREATE TABLE IF NOT EXISTS request_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        client_ip TEXT,
+        path TEXT,
+        backend TEXT,
+        response_time_ms INTEGER,
+        status_code INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS health_check_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        backend TEXT,
+        is_alive BOOLEAN,
+        response_time_ms INTEGER
+    );
+    `
+
+    _, err = db.Exec(schema)
+    if err != nil {
+        log.Fatalf("Failed to initialize schema: %v", err)
+    }
+
+    return db
+}
+
+func logRequest(ip, path, backend string, respTime int64, status int) {
+    _, err := db.Exec(`INSERT INTO request_logs (client_ip, path, backend, response_time_ms, status_code)
+                       VALUES (?, ?, ?, ?, ?)`, ip, path, backend, respTime, status)
+    if err != nil {
+        log.Printf("DB insert failed: %v", err)
+    }
+}
+
+func logHealthCheck(backend string, alive bool, respTime int64) {
+    _, err := db.Exec(`INSERT INTO health_check_logs (backend, is_alive, response_time_ms)
+                       VALUES (?, ?, ?)`, backend, alive, respTime)
+    if err != nil {
+        log.Printf("DB insert failed: %v", err)
+    }
+}
+
+
 func handleErr(err error) {
 	if err != nil {
 		fmt.Println(err)
@@ -86,16 +149,24 @@ func (s *simpleServer) isAlive() bool {
 }
 
 func (s *simpleServer) checkHealth() {
+	start := time.Now()
 	client := http.Client{Timeout: 2 * time.Second}
 	resp, err := client.Get(s.addr + "/health")
+	duration := time.Since(start).Milliseconds()
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	
+	// defer s.mu.Unlock()
+	
 	if err != nil || resp.StatusCode != http.StatusOK {
 		s.alive = false
+		logHealthCheck(s.addr, false, duration)
 	} else {
 		s.alive = true
+		logHealthCheck(s.addr, true, duration)
 		resp.Body.Close()
 	}
+	s.mu.Unlock()
 }
 
 func initialiseServer(addr string) *simpleServer {
@@ -291,6 +362,7 @@ func (s *simpleServer) Serve(rw http.ResponseWriter, req *http.Request) {
 // }
 
 func (lb *LoadBalancer) serveProxy(rw http.ResponseWriter, req *http.Request) {
+	start := time.Now()
 	log.Println("Incoming request")
 	targetServer := lb.getNextAvailableSever()
 	if targetServer == nil {
@@ -299,7 +371,15 @@ func (lb *LoadBalancer) serveProxy(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	fmt.Println("Serving request to ", targetServer.Address())
+
+	lrw := &loggingResponseWriter{ResponseWriter: rw, statusCode: http.StatusOK}
+
+	targetAddr := targetServer.Address()
+
 	targetServer.Serve(rw, req)
+
+	duration := time.Since(start).Milliseconds()
+    logRequest(req.RemoteAddr, req.URL.Path, targetAddr, duration, lrw.statusCode)
 }
 
 func readFile(path string) ([]byte, error) {
@@ -347,6 +427,8 @@ func main() {
 	cfg := loadConfig("../configs/config.yaml")
 	fmt.Println(cfg.Server.Host)
 	fmt.Println(cfg.HealthCheck.Interval)
+
+	db = setupDB("lb_logs.db")
 
 	var servers []Server
 	for _, addr := range cfg.Backends {
