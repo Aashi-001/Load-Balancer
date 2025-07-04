@@ -15,10 +15,47 @@ import (
 	"gopkg.in/yaml.v2"
 	"database/sql"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // import "os"
 var db *sql.DB
+
+var (
+    requestsTotal = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "lb_requests_total",
+            Help: "Total number of requests processed by the load balancer",
+        },
+        []string{"backend", "algorithm", "status"},
+    )
+    
+    responseTime = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name: "lb_response_duration_seconds",
+            Help: "Response time distribution",
+            Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+        },
+        []string{"backend", "algorithm"},
+    )
+    
+    activeConnections = prometheus.NewGaugeVec(
+        prometheus.GaugeOpts{
+            Name: "lb_active_connections",
+            Help: "Number of active connections per backend",
+        },
+        []string{"backend"},
+    )
+    
+    backendHealth = prometheus.NewGaugeVec(
+        prometheus.GaugeOpts{
+            Name: "lb_backend_health",
+            Help: "Health status of backends (1=healthy, 0=unhealthy)",
+        },
+        []string{"backend"},
+    )
+)
 
 type Config struct {
 	Server struct {
@@ -129,10 +166,12 @@ func (s *simpleServer) increment() {
 	// atomic.AddInt32(&s.activeConns, 1)
 	atomic.AddInt32(&s.activeConns, 1)
 	atomic.AddInt64(&s.requests, 1)
+	activeConnections.WithLabelValues(s.addr).Set(float64(s.getActiveConns()))
 }
 
 func (s *simpleServer) decrement() {
 	atomic.AddInt32(&s.activeConns, -1)
+	activeConnections.WithLabelValues(s.addr).Set(float64(s.getActiveConns()))
 }
 
 func (s *simpleServer) getActiveConns() int32 {
@@ -161,9 +200,11 @@ func (s *simpleServer) checkHealth() {
 	if err != nil || resp.StatusCode != http.StatusOK {
 		s.alive = false
 		logHealthCheck(s.addr, false, duration)
+		backendHealth.WithLabelValues(s.addr).Set(0)
 	} else {
 		s.alive = true
 		logHealthCheck(s.addr, true, duration)
+		backendHealth.WithLabelValues(s.addr).Set(1)
 		resp.Body.Close()
 	}
 	s.mu.Unlock()
@@ -307,6 +348,14 @@ func (s *simpleServer) Serve(rw http.ResponseWriter, req *http.Request) {
 // 	}
 // }
 
+
+func init() {
+    prometheus.MustRegister(requestsTotal)
+    prometheus.MustRegister(responseTime)
+    prometheus.MustRegister(activeConnections)
+    prometheus.MustRegister(backendHealth)
+}
+
 func (lb *LoadBalancer) serveProxy(rw http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 	log.Println("Incoming request")
@@ -324,8 +373,11 @@ func (lb *LoadBalancer) serveProxy(rw http.ResponseWriter, req *http.Request) {
 
 	targetServer.Serve(lrw, req)
 
-	duration := time.Since(start).Milliseconds()
-    logRequest(req.RemoteAddr, req.URL.Path, targetAddr, duration, lrw.statusCode)
+	duration := time.Since(start)
+    logRequest(req.RemoteAddr, req.URL.Path, targetAddr, duration.Milliseconds(), lrw.statusCode)
+
+	requestsTotal.WithLabelValues(targetAddr, lb.algorithm, fmt.Sprintf("%d", lrw.statusCode)).Inc()
+    responseTime.WithLabelValues(targetAddr, lb.algorithm).Observe(duration.Seconds())
 }
 
 func readFile(path string) ([]byte, error) {
@@ -398,6 +450,14 @@ func main() {
 			time.Sleep(5 * time.Second)
 		}
 	}()
+
+	go func() {
+        http.Handle("/metrics", promhttp.Handler())
+        log.Println("Metrics server starting on :2112")
+        if err := http.ListenAndServe(":2112", nil); err != nil {
+            log.Printf("Metrics server failed: %v", err)
+        }
+    }()
 
 	http.HandleFunc("/", lb.serveProxy)
 

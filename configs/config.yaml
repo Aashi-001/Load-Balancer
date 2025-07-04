@@ -7,7 +7,7 @@ backends:
   - "http://localhost:9001"
   - "http://localhost:9002"
 
-algorithm: "roundrobin"
+algorithm: "leastconn"
 
 health_check:
   interval: 30s
