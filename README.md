@@ -10,6 +10,7 @@ A concurrent HTTP load balancer built in Go with multiple algorithms, health mon
 - **YAML Configuration**: Backend management and algorithm selection
 - **Concurrent Request Handling**: Built on Go's goroutine model
 - **Graceful Error Handling**: Returns 503 when no healthy backends available
+- **SQLite Logging**: Stores request & health check data in `lb_logs.db`
 
 ## Quick Start
 
@@ -63,6 +64,25 @@ Routes requests to the backend with the fewest active connections. Displays curr
 
 ### Random (`random`)
 Randomly selects from available healthy backends.
+
+### SQLite Logging
+- The load balancer automatically creates lb_logs.db and logs:
+
+    |Table | What it stores|
+    |------|---------------|
+    |request_logs | Client IP, path, backend, latency, status code |
+    |health_check_logs | Backend health status & response time |
+
+- Inspect logs anytime using sqlite3:
+
+    ```
+    sqlite3 lb_logs.db
+    ```
+    ```
+    .tables
+    SELECT * FROM request_logs ORDER BY timestamp DESC LIMIT 5;
+    SELECT backend, AVG(response_time_ms) FROM request_logs GROUP BY backend;
+    ```
 
 <!-- ## Implementation Details
 
