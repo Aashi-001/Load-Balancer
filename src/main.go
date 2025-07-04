@@ -190,74 +190,20 @@ func newLoadBalancer(servers []Server, port string, algo string) *LoadBalancer {
 var rrCounter int32
 
 func (lb *LoadBalancer) getNextRoundRobinServer() Server {
-	// start := rrIndex
-	// for {
-	// 	server := lb.servers[rrIndex]
-	// 	rrIndex = (rrIndex + 1) % len(lb.servers)
-	// 	if server.isAlive() {
-	// 		return server
-	// 	}
-	// 	if rrIndex == start {
-	// 		return server
-	// 	}
-	// }
-	// println("starting roundrobin")
-	// total := int32(len(lb.servers))
-	// if total == 0 {
-	// 	log.Println("No backend servers available")
-	// 	return nil
-	// }
-
-	// for {
-	// 	println("entering for loop")
-	// 	index := atomic.AddInt32(&rrCounter, 1)
-	// 	if index < 0 {
-	// 		index = 0
-	// 		atomic.StoreInt32(&rrCounter, 0)
-	// 	}
-	// 	println("index is: ", index)
-	// 	server := lb.servers[int(index)%int(total)]
-	// 	if server.isAlive() {
-	// 		println("returning: ", server.Address())
-	// 		return server
-	// 	}
-	// }
-	// println("nothing selected")
-	// return nil
 	total := len(lb.servers)
-	if total == 0 {
-		return nil
-	}
-	
-	// index := atomic.AddInt32(&rrCounter, 1)
-	// if index < 0 {
-	// 	index = 0
-	// 	atomic.StoreInt32(&rrCounter, 0)
-	// }
-	
-	// return lb.servers[int(index)%total]
-	cnt := 0
-	for range total {
-		index := atomic.AddInt32(&rrCounter, 1)
-		if index < 0 {
-			index = 0
-			atomic.StoreInt32(&rrCounter, 0)
-		}
-		// if index > int32(total) {
-		// 	if cnt > 3 {
-		// 		return nil
-		// 	}
-		// 	index = 0
-		// }
-		server := lb.servers[int(index)%total]
-		println("checking aliveness")
-		if server.isAlive() {
-			return server
-		}
-		cnt++
-	}
-
-	return nil
+    if total == 0 {
+        return nil
+    }
+    
+    start := int(atomic.AddInt32(&rrCounter, 1) % int32(total))
+    
+    for i := range total {
+        index := (start + i) % total
+        if lb.servers[index].isAlive() {
+            return lb.servers[index]
+        }
+    }
+    return nil
 }
 
 func (lb *LoadBalancer) getLeastConnServer() Server {
@@ -376,7 +322,7 @@ func (lb *LoadBalancer) serveProxy(rw http.ResponseWriter, req *http.Request) {
 
 	targetAddr := targetServer.Address()
 
-	targetServer.Serve(rw, req)
+	targetServer.Serve(lrw, req)
 
 	duration := time.Since(start).Milliseconds()
     logRequest(req.RemoteAddr, req.URL.Path, targetAddr, duration, lrw.statusCode)
@@ -423,12 +369,19 @@ func main() {
 
 	// err := http.ListenAndServe(":"+lb.port, nil)
 	// handleErr(err)
+
+	create_servers();
+
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	// println("reading config")
 	cfg := loadConfig("../configs/config.yaml")
+	// println("done")
 	fmt.Println(cfg.Server.Host)
 	fmt.Println(cfg.HealthCheck.Interval)
 
+	// println("initialising db")
 	db = setupDB("lb_logs.db")
+	// println("done")
 
 	var servers []Server
 	for _, addr := range cfg.Backends {
