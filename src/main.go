@@ -195,7 +195,7 @@ func (s *simpleServer) checkHealth() {
 
 	s.mu.Lock()
 	
-	// defer s.mu.Unlock()
+	defer s.mu.Unlock()
 	
 	if err != nil || resp.StatusCode != http.StatusOK {
 		s.alive = false
@@ -207,7 +207,7 @@ func (s *simpleServer) checkHealth() {
 		backendHealth.WithLabelValues(s.addr).Set(1)
 		resp.Body.Close()
 	}
-	s.mu.Unlock()
+	// s.mu.Unlock()
 }
 
 func initialiseServer(addr string) *simpleServer {
